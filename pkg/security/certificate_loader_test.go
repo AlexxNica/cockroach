@@ -17,12 +17,19 @@
 package security_test
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
@@ -68,8 +75,37 @@ func countLoadedCertificates(certsDir string) (int, error) {
 	return len(cl.Certificates()), nil
 }
 
+// Generate a valid x509 CA certificate. Returns the x509 certificate and the
+// PEM-encoded contents (suitable to write to a .crt file).
+func makeTestCACert() (*x509.Certificate, []byte, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 512)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certBytes, err := security.GenerateCA(key, time.Hour*48)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	x509Cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certBlock := &pem.Block{Type: "CERTIFICATE", Bytes: certBytes}
+	return x509Cert, pem.EncodeToMemory(certBlock), nil
+}
+
 func TestNamingScheme(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Make a valid x509 certificate. We don't use it here, but we do need something that
+	// parses as a valid pem-encoded x509 certificate.
+	x509Cert, certContents, err := makeTestCACert()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Do not use embedded certs.
 	security.ResetAssetLoader()
@@ -209,7 +245,12 @@ func TestNamingScheme(t *testing.T) {
 		// Write all files.
 		for _, f := range data.files {
 			n := f.name
-			if err := ioutil.WriteFile(filepath.Join(certsDir, n), []byte(n), f.mode); err != nil {
+			contents := []byte(n)
+			if strings.HasSuffix(n, ".crt") {
+				// Write a real certificate, it needs to parse.
+				contents = certContents
+			}
+			if err := ioutil.WriteFile(filepath.Join(certsDir, n), contents, f.mode); err != nil {
 				t.Fatalf("#%d: could not write file %s: %v", testNum, n, err)
 			}
 		}
@@ -235,9 +276,11 @@ func TestNamingScheme(t *testing.T) {
 			if expected.Error == nil {
 				if actual.Error != nil {
 					t.Errorf("#%d: expected success, got error: %+v", testNum, actual.Error)
+					continue
 				}
 			} else if !testutils.IsError(actual.Error, expected.Error.Error()) {
 				t.Errorf("#%d: mismatched error, expected: %+v, got %+v", testNum, expected, actual)
+				continue
 			}
 
 			// Compare some fields.
@@ -246,12 +289,34 @@ func TestNamingScheme(t *testing.T) {
 				actual.KeyFilename != expected.KeyFilename ||
 				actual.Name != expected.Name {
 				t.Errorf("#%d: mismatching CertInfo, expected: %+v, got %+v", testNum, expected, actual)
+				continue
 			}
-			if actual.Filename != "" && string(actual.FileContents) != actual.Filename {
-				t.Errorf("#%d: bad file contents: expected %s, got %s", testNum, actual.Filename, actual.FileContents)
+			if actual.Filename != "" {
+				if !bytes.Equal(actual.FileContents, certContents) {
+					t.Errorf("#%d: bad file contents: expected %s, got %s", testNum, actual.Filename, actual.FileContents)
+					continue
+				}
+				if a, e := len(actual.ParsedCertificates), 1; a != e {
+					t.Errorf("#%d: expected %d certificates, found: %d", testNum, e, a)
+					continue
+				}
+				if a, e := actual.ParsedCertificates[0], x509Cert; !bytes.Equal(a.Raw, e.Raw) {
+					t.Errorf("#%d: mismatched certificate: %+v vs %+v", testNum, a, e)
+					continue
+				}
+				exp, err := actual.ExpirationTime()
+				if err != nil {
+					t.Errorf("#%d: unexpected error on ExpirationTime: %v", testNum, err)
+					continue
+				}
+				if e := x509Cert.NotAfter; exp != e {
+					t.Errorf("#%d: mismatched expiration: %s vs %s", testNum, exp, e)
+					continue
+				}
 			}
 			if actual.KeyFilename != "" && string(actual.KeyFileContents) != actual.KeyFilename {
 				t.Errorf("#%d: bad file contents: expected %s, got %s", testNum, actual.KeyFilename, actual.KeyFileContents)
+				continue
 			}
 		}
 

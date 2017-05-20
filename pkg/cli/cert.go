@@ -170,8 +170,16 @@ func runListCerts(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stdout, "Certificate directory: %s\n", baseCfg.SSLCertsDir)
 
-	certTableHeaders := []string{"Usage", "Certificate File", "Key File", "Notes", "Error"}
+	certTableHeaders := []string{"Usage", "Certificate File", "Key File", "Notes", "Expires", "Error"}
 	var rows [][]string
+
+	expirationString := func(ci *security.CertInfo) string {
+		exp, err := ci.ExpirationTime()
+		if err != nil {
+			return err.Error()
+		}
+		return exp.Format("2006/01/02")
+	}
 
 	if ca := cm.CACert(); ca != nil {
 		var errString string
@@ -183,6 +191,7 @@ func runListCerts(cmd *cobra.Command, args []string) error {
 			ca.Filename,
 			ca.KeyFilename,
 			"",
+			expirationString(ca),
 			errString,
 		})
 	}
@@ -197,6 +206,7 @@ func runListCerts(cmd *cobra.Command, args []string) error {
 			node.Filename,
 			node.KeyFilename,
 			"",
+			expirationString(node),
 			errString,
 		})
 	}
@@ -210,6 +220,7 @@ func runListCerts(cmd *cobra.Command, args []string) error {
 			cert.Filename,
 			cert.KeyFilename,
 			fmt.Sprintf("user=%s", name),
+			expirationString(cert),
 			errString,
 		})
 	}
